@@ -1,0 +1,284 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ───────────────────────── Tenancy & Auth ─────────────────────────
+
+model Organization {
+  id            String   @id @default(cuid())
+  name          String
+  timezone      String   @default("Asia/Kolkata")
+  // Kill switch: pauses ALL outbound messages for this org
+  sendingPaused Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  members     Member[]
+  credentials OrgCredentials?
+  clients     Client[]
+  invoices    Invoice[]
+  batches     UploadBatch[]
+  columnMaps  ColumnMapping[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String? // null if Google/Supabase auth
+  name         String?
+  createdAt    DateTime @default(now())
+
+  memberships Member[]
+}
+
+enum MemberRole {
+  OWNER
+  STAFF
+}
+
+model Member {
+  id             String       @id @default(cuid())
+  userId         String
+  organizationId String
+  role           MemberRole   @default(OWNER)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+enum MonthlyInvoices {
+  UNDER_50      @map("<50")
+  FROM_50_200   @map("50-200")
+  FROM_200_1000 @map("200-1000")
+  OVER_1000     @map("1000+")
+}
+
+enum LeadPersona {
+  BUSINESS_OWNER       @map("business owner")
+  CHARTERED_ACCOUNTANT @map("chartered accountant")
+  INVESTOR_OR_PARTNER  @map("investor or partner")
+  OTHER                @map("other")
+}
+
+model Lead {
+  id              String          @id @default(cuid())
+  name            String
+  businessName    String
+  phone           String?
+  email           String
+  monthlyInvoices MonthlyInvoices
+  persona         LeadPersona     @default(OTHER)
+  message         String?
+  source          String
+  createdAt       DateTime        @default(now())
+
+  @@index([createdAt])
+}
+
+/// All secrets stored AES-256-GCM encrypted (format: iv:tag:ciphertext, base64). Never log these.
+model OrgCredentials {
+  id                       String   @id @default(cuid())
+  organizationId           String   @unique
+  waPhoneNumberId          String
+  waBusinessAccountId      String
+  waAccessTokenEnc         String
+  waTemplateInvoice        String   @default("invoice_dispatch") // approved template names
+  waTemplateReminder       String   @default("payment_reminder")
+  waTemplateThanks         String   @default("payment_received")
+  waTemplateLanguage       String   @default("en")
+  razorpayKeyId            String
+  razorpayKeySecretEnc     String
+  razorpayWebhookSecretEnc String
+  updatedAt                DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([waPhoneNumberId]) // lookup org from incoming Meta webhook
+}
+
+// ───────────────────────── Clients & Invoices ─────────────────────────
+
+model Client {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  phoneE164      String // normalized, e.g. +919876543210
+  waOptedOut     Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invoices     Invoice[]
+
+  @@unique([organizationId, phoneE164, name])
+  @@index([organizationId])
+}
+
+enum InvoiceStatus {
+  PENDING // uploaded, initial dispatch not yet sent
+  REMINDER_ACTIVE // dispatched, reminder sequence running
+  PENDING_VERIFICATION // client tapped "Already Paid" - reminders paused, owner must verify
+  PAID
+  FAILED // dispatch failed permanently
+  CANCELLED // owner cancelled
+}
+
+enum PaymentSource {
+  RAZORPAY_WEBHOOK
+  MANUAL_OWNER
+}
+
+model Invoice {
+  id             String        @id @default(cuid())
+  organizationId String
+  clientId       String
+  batchId        String?
+  invoiceNumber  String
+  amountPaise    Int // store money as integer paise; never floats
+  currency       String        @default("INR")
+  dueDate        DateTime      @db.Date
+  pdfUrl         String? // S3/Supabase Storage URL (must be publicly fetchable by Meta, or signed)
+  status         InvoiceStatus @default(PENDING)
+
+  // Razorpay payment link
+  rzpPaymentLinkId String? @unique
+  rzpShortUrl      String?
+  rzpPaymentId     String?
+
+  paidAt            DateTime?
+  paidAmountPaise   Int?
+  paidSource        PaymentSource?
+  claimedPaidAt     DateTime? // when client tapped "Already Paid"
+  lastFailureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  client       Client             @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  batch        UploadBatch?       @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  reminders    ReminderSchedule[]
+  messages     MessageLog[]
+
+  // Re-uploading the same report must not create duplicates
+  @@unique([organizationId, invoiceNumber])
+  @@index([organizationId, status])
+  @@index([organizationId, dueDate])
+  @@index([clientId])
+}
+
+// ───────────────────────── Reminder engine ─────────────────────────
+
+enum ReminderKind {
+  INITIAL_DISPATCH
+  BEFORE_DUE_3D
+  ON_DUE_DATE
+  AFTER_DUE_2D
+}
+
+enum ReminderState {
+  SCHEDULED
+  SENT
+  SKIPPED // guard tripped at fire time (paid / paused / opted-out)
+  CANCELLED // removed from queue
+  FAILED
+}
+
+/// DB mirror of BullMQ delayed jobs - source of truth for the dashboard and for
+/// rebuilding the queue if Redis is ever lost (see reconcile job).
+model ReminderSchedule {
+  id         String        @id @default(cuid())
+  invoiceId  String
+  kind       ReminderKind
+  runAt      DateTime
+  state      ReminderState @default(SCHEDULED)
+  bullJobId  String        @unique // deterministic: rem__<invoiceId>__<KIND>
+  attempts   Int           @default(0)
+  lastError  String?
+  skipReason String?
+  firedAt    DateTime?
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, kind])
+  @@index([state, runAt])
+}
+
+enum MessageDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum MessageStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+model MessageLog {
+  id             String           @id @default(cuid())
+  invoiceId      String?
+  organizationId String
+  direction      MessageDirection
+  kind           String // ReminderKind | THANK_YOU | BUTTON_REPLY
+  body           String? // Rendered template text for the demo simulator
+  waMessageId    String?          @unique
+  status         MessageStatus    @default(QUEUED)
+  error          String?
+  createdAt      DateTime         @default(now())
+
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@index([organizationId, createdAt])
+}
+
+/// Idempotency for webhooks (Razorpay retries; Meta retries). Insert first, process only if insert succeeds.
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  provider   String // "razorpay" | "meta"
+  externalId String // razorpay x-razorpay-event-id / meta message id
+  receivedAt DateTime @default(now())
+
+  @@unique([provider, externalId])
+}
+
+// ───────────────────────── Uploads ─────────────────────────
+
+model UploadBatch {
+  id             String   @id @default(cuid())
+  organizationId String
+  fileName       String
+  totalRows      Int
+  createdRows    Int      @default(0)
+  skippedRows    Int      @default(0)
+  errors         Json? // [{row, message}]
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invoices     Invoice[]
+
+  @@index([organizationId, createdAt])
+}
+
+model ColumnMapping {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String   @default("default")
+  mapping        Json // { clientName: "Party", clientPhone: "Mobile", ... }
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, name])
+}
